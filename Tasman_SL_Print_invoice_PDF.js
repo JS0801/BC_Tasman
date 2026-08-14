@@ -4,24 +4,162 @@
 * @NModuleScope SameAccount
 *
 * Reformatted from the original single-invoice "Print BC PDF" Suitelet.
-* Same script/deployment now supports two modes via URL parameters:
+* Same script/deployment supports two modes via URL parameters:
 *
-*   ?recId=<invoiceId>   -> ORIGINAL behavior, unchanged: renders + streams one invoice PDF,
-*                           saves it to the file cabinet, stamps custbody_bc_pdf_file.
+*   ?recId=<invoiceId>   -> renders + streams one invoice PDF, saves it to the file
+*                           cabinet, stamps custbody_bc_pdf_file.
 *
-*   ?custId=<customerId> -> Finds all OPEN invoices for that customer, renders each one
-*                           with the exact same logic/template as above, then merges them into
-*                           a single PDF (like native NetSuite bulk print) and streams the result.
-*                           Each invoice that renders successfully then has its "To Be Printed"
-*                           (tobeprinted) checkbox cleared, so clicking the button again only
-*                           picks up invoices that are newly flagged since the last run.
+*   ?custId=<customerId> -> Finds all invoices flagged "To Be Printed" for that customer,
+*                           renders EACH ONE AS ITS OWN PDF named
+*                           "<tranid> <1st word of job.custentity26>_<initials from job.custentity4>.pdf",
+*                           then streams all of them back as a single ZIP download.
+*                           Each invoice is also saved to the file cabinet and stamped with its
+*                           own custbody_bc_pdf_file, and has its "To Be Printed" checkbox
+*                           cleared, so clicking the button again only picks up invoices newly
+*                           flagged since the last run.
+*
+* CHANGE LOG (v18):
+*   - GOVERNANCE FIX: bulk mode was hitting the Suitelet's 1000-unit budget after ~12
+*     invoices regardless of how many were flagged (32-invoice test run: 12 zipped, 20
+*     left "NOT ATTEMPTED"). Turned off the two priciest per-invoice costs in bulk mode:
+*       STAMP_PDF_FIELD_IN_BULK:        true -> false  (was ~10 units/invoice: the
+*         submitFields call stamping custbody_bc_pdf_file)
+*       SAVE_INDIVIDUAL_PDFS_TO_CABINET: true -> false  (was ~20+ units/invoice: the
+*         file.save() into PDF_FOLDER_ID, more if it collided with an existing file name
+*         and had to search+delete+resave)
+*     Net effect for BULK-PRINTED invoices only: no file-cabinet copy of the PDF gets
+*     saved to folder 2654, and custbody_bc_pdf_file does NOT get populated. The PDF
+*     still gets built, still gets the correct file name, still goes into the ZIP - it's
+*     just never persisted anywhere after the response streams, so if the ZIP isn't kept
+*     there's no other copy. Single-invoice mode (?recId=) is untouched - buildInvoicePdf
+*     is called there with saveToCabinet defaulted to true regardless of these flags, so
+*     it keeps saving + stamping exactly as before.
+*     Expected result: per-invoice governance drops from ~60-90 units to roughly 30-35,
+*     so a single click should clear something in the neighborhood of 25-30 invoices
+*     instead of ~12 - still governance-limited, just a higher ceiling. If a customer
+*     regularly has 50-100+ flagged, this alone won't get them all in one click; the
+*     manifest's "NOT ATTEMPTED" list + re-clicking the button still handles the rest
+*     safely (tobeprinted stays checked on anything not zipped).
+*
+* CHANGE LOG (v17):
+*   - FIX: file.create() for each generated PDF was passing encoding: file.Encoding.UTF8 on
+*     binary PDF content. Any byte >127 in the stream (AcroForm field dictionaries, appearance
+*     streams, embedded fonts) gets reinterpreted/mangled as UTF-8 text during that round-trip,
+*     which silently breaks the PDF's fillable form fields even though the PDF still opens and
+*     renders visually. Single-invoice mode never hit this because it streams the raw
+*     render.renderAsPdf() output directly instead of going through file.create(). Removed the
+*     encoding param so file.create() writes the binary content untouched. This affected the
+*     saved-to-cabinet PDF, the custbody_bc_pdf_file-stamped copy, AND the ZIP entry in bulk
+*     mode (since pdfFile is what gets zipped when ZIP_FROM_SAVED_FILES is false), so this is
+*     the fix for "form fields used to be editable in Adobe, now they aren't" on bulk exports.
+*
+* CHANGE LOG (v16):
+*   - File name boundaries are now per-field, not one global separator: a SPACE after the
+*     tranid, an UNDERSCORE between custentity26 and custentity4 ->
+*     "INV1042 Riverbend_JD.pdf". Set via each JOB_NAME_FIELDS entry's `separator`.
+*   - JOB_NAME_FIELDS, JOB_NAME_FIELD_TRANSFORMS and FILE_NAME_SEPARATOR collapsed into a
+*     single declarative spec array; the two wiring lines at the bottom are gone.
+*
+* CHANGE LOG (v15):
+*   - Whitespace inside a value is normalised to an underscore per-part; the ZIP name is
+*     fully underscore-separated (ZIP_NAME_SEPARATOR).
+*
+* CHANGE LOG (v14):
+*   - custentity26 contributes only its FIRST WORD to the file name.
+*   - custentity4 contributes APPROVER INITIALS parsed from its "ENV-<name>" value.
+*   - Both via per-field `transform` functions, so further per-field rules don't need
+*     changes to buildInvoiceFileName().
+*   - getJobNameParts() now returns one entry PER FIELD; the old flat array desynced from
+*     JOB_NAME_FIELDS if either field was a multiselect.
+*
+* CHANGE LOG (v13):
+*   - File name parts are now space-separated, not " - " separated.
+*   - Job name field changed from custentity25 to custentity26 (JOB_NAME_FIELDS).
+*
+* CHANGE LOG (v12):
+*   - Bulk mode delivers a ZIP of individually-named PDFs (N/compress) instead of the v11
+*     HTML index page. One click, one download. renderResultsPage()/escapeHtml()/getFileUrl()
+*     removed as dead weight; per-run reporting moved into _manifest.txt inside the ZIP.
+*
+* CHANGE LOG (v11):
+*   - Bulk mode no longer merges into one <pdfset> PDF; each invoice is a separate PDF.
+*   - New file naming convention applied in BOTH modes via buildInvoiceFileName().
+*     To keep single-invoice mode on the old "<tranid>.pdf" name, see the ONE-LINE REVERT
+*     note inside buildInvoicePdf().
+*   - Bulk mode now stamps custbody_bc_pdf_file per invoice (it couldn't before, because
+*     there was no per-invoice file). Toggle with STAMP_PDF_FIELD_IN_BULK.
+*   - Added a per-execution cache to determineBillGrouping(); it was running one search per
+*     billable line with no reuse, which was the single largest governance consumer in bulk mode.
+*   - Removed stripXmlPreamble() and the asXmlString branch of buildInvoicePdf(); both existed
+*     only to support <pdfset> merging.
 *
 * NOTE on which invoices are picked up: getOpenInvoiceIdsForCustomer() filters solely on
 * tobeprinted = T (the native "To Be Printed" flag), matching how native bulk print
 * selects documents. Transaction status is not considered.
 */
 
-define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runtime', 'N/url', 'N/config', 'N/format'], function(render, record, xml, file, task, search, runtime, url, config, format) {
+define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runtime', 'N/url', 'N/config', 'N/format', 'N/compress'], function(render, record, xml, file, task, search, runtime, url, config, format, compress) {
+
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  var TEMPLATE_FILE_ID = 7618;   // BFO/FreeMarker template in the file cabinet
+  var PDF_FOLDER_ID    = 2654;   // destination folder for generated invoice PDFs
+  var LOGO_SUBSIDIARY_ID = 1;
+
+  // Job (project) fields appended to the tranid, in order, to form the file name.
+  //
+  //   <tranid> + ' ' + firstWord(custentity26) + '_' + approverInitials(custentity4)
+  //   e.g. "INV1042 Riverbend_JD.pdf"
+  //
+  // `separator` is what PRECEDES that field, so each boundary is set independently - a
+  // space after the tranid, an underscore between the two job fields. `transform` is
+  // optional; omit it to use the field's value verbatim. firstWord/approverInitials are
+  // function declarations further down and so are hoisted, hence usable here.
+  var JOB_NAME_FIELDS = [
+    { fieldId: 'custentity26', separator: ' ', transform: firstWord },
+    { fieldId: 'custentity4',  separator: '_', transform: approverInitials }
+  ];
+
+  // Pattern that strips the "ENV-" prefix off custentity4 and captures the rest.
+  // Tolerates "ENV-", "env -", "ENV_", "ENV:" and any spacing. Change 'env' here if the
+  // prefix is ever renamed. The capture is deliberately (.*) not (.+): a bare "ENV-" with
+  // nothing after it must still count as "prefix found, no name", so it returns blank
+  // rather than failing to match and falling through to the whole-value fallback.
+  var APPROVER_PREFIX_PATTERN = /env\s*[-\u2013\u2014_:]\s*(.*)$/i;
+
+  // A single all-letter token no longer than this is treated as initials that are already
+  // initials ("JD" stays "JD") rather than a surname to be reduced to one letter.
+  var MAX_EXISTING_INITIALS_LENGTH = 4;
+
+  // Separator used in the ZIP file name, independent of the PDF name boundaries above.
+  var ZIP_NAME_SEPARATOR = '_';
+  var MAX_FILE_NAME_LENGTH = 200;   // NetSuite hard limit is 255; leave headroom for ".pdf"
+
+  // Bulk mode: stamp custbody_bc_pdf_file on each invoice with its own PDF.
+  // Costs ~10 governance units per invoice. v18: OFF by default - see CHANGE LOG. Requires
+  // SAVE_INDIVIDUAL_PDFS_TO_CABINET to be true to have a file id to stamp with, so flipping
+  // this back on with that still false is a no-op (stampInvoice is guarded by `&& fileId`
+  // inside buildInvoicePdf).
+  var STAMP_PDF_FIELD_IN_BULK = false;
+
+  // Bulk mode: persist each PDF to PDF_FOLDER_ID (20+ units each) rather than only putting
+  // it in the ZIP. v18: OFF by default - see CHANGE LOG. The PDF is still built and still
+  // goes into the ZIP either way; this only controls whether a standalone copy is also kept
+  // in the file cabinet.
+  var SAVE_INDIVIDUAL_PDFS_TO_CABINET = false;
+
+  // Bulk mode: keep a copy of the generated ZIP in the file cabinet as well as streaming it.
+  var SAVE_ZIP_TO_CABINET = false;
+
+  // Include a _manifest.txt inside the ZIP summarising what was generated, what failed,
+  // and what was left for the next run. Costs nothing and saves a trip to the script log.
+  var INCLUDE_ZIP_MANIFEST = true;
+
+  // If archiver.add() rejects in-memory files in this account's version, flip this to true
+  // to re-load each saved PDF from the file cabinet before adding it. Costs 10 units per
+  // invoice and more memory, so it's off by default. Requires SAVE_INDIVIDUAL_PDFS_TO_CABINET.
+  var ZIP_FROM_SAVED_FILES = false;
 
   // ---------------------------------------------------------------------
   // Per-execution caches. In single-invoice mode these are populated once and
@@ -32,8 +170,10 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
   var _billingClassCache = null;
   var _timeBillingCache = {};
   var _templateCache = null;
+  var _jobNamePartsCache = {};
+  var _billGroupingCache = {};
 
-  var SCRIPT_VERSION = 'v9-2026-07-29-clear-tobeprinted';
+  var SCRIPT_VERSION = 'v18-2026-08-13-bulk-governance-tune';
 
   function onRequest(context) {
 
@@ -48,7 +188,7 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
 
     try {
       if (recId) {
-        // ---- original single-invoice behavior, unchanged ----
+        // ---- single-invoice behavior: stream the PDF inline ----
         var result = buildInvoicePdf(recId, true);
         response.writeFile({
           file: result.file,
@@ -58,7 +198,7 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
       }
 
       if (custId) {
-        // ---- bulk print all open invoices for a customer ----
+        // ---- bulk: one PDF per open invoice, then return an index page ----
         printAllOpenInvoicesForCustomer(context, custId);
         return;
       }
@@ -76,12 +216,16 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
    * template-rendering logic as the original script.
    * @param {string|number} recId - internal id of the invoice
    * @param {boolean} stampInvoice - if true, stamps custbody_bc_pdf_file on the invoice
-   *        with the generated PDF's file id (original single-invoice behavior).
-   * @param {boolean} asXmlString - if true, skips PDF generation and file cabinet save
-   *        entirely, returning the populated XML string for <pdfset> merging in bulk mode.
-   * @returns {{trandoc: string, file: File, fileId: number}} or {{trandoc, xmlString}}
+   *        with the generated PDF's file id. Requires saveToCabinet.
+   * @param {boolean} [saveToCabinet=true] - if false, the PDF is returned in memory only and
+   *        never written to PDF_FOLDER_ID. Defaults to true so single-invoice mode is unchanged.
+   * @returns {{trandoc: string, fileName: string, file: File, pdfFile: File, fileId: number}}
+   *        `file` is the raw render output (used for streaming a single invoice); `pdfFile` is
+   *        the same content under the client's naming convention (used as a ZIP entry).
    */
-  function buildInvoicePdf(recId, stampInvoice, asXmlString) {
+  function buildInvoicePdf(recId, stampInvoice, saveToCabinet) {
+
+    if (saveToCabinet === undefined) saveToCabinet = true;
 
     log.debug('recId', recId);
     var finalArray = [];
@@ -420,11 +564,6 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
           line: k,
         });
 
-        // var grouping = determineTimeGrouping(timeID);
-        // var tranid = grouping.tranid;
-        // var group = grouping.type;
-        // var entity = grouping.entity;
-
         if (grouping == "Labor") {
           tranid = '';
         }
@@ -454,10 +593,10 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
     // execution and reuse. Inlined deliberately rather than calling out to a helper.
     if (_templateCache === null) {
       var loadedTemplate = file.load({
-        id: 7618
+        id: TEMPLATE_FILE_ID
       }).getContents();
 
-      var subrec = record.load({type: 'subsidiary', id: 1});
+      var subrec = record.load({type: 'subsidiary', id: LOGO_SUBSIDIARY_ID});
       var logo = subrec.getValue('logo');
 
       if (logo) {
@@ -498,27 +637,34 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
 
     renderer.templateContent = xmlTemplateFile;
 
-    // Bulk mode: hand back the populated XML so the caller can wrap every invoice
-    // in a single <pdfset> and render once. Avoids creating a file cabinet PDF per
-    // invoice, which SuiteScript has no API to merge anyway.
-    if (asXmlString) {
-      return { trandoc: trandoc, xmlString: renderer.renderAsString() };
-    }
-
     var coverfile = renderer.renderAsPdf();
 
+    // ONE-LINE REVERT: to keep single-invoice mode on the old "<tranid>.pdf" name,
+    // change the line below to:  var fileName = trandoc + '.pdf';
+    var fileName = buildInvoiceFileName(trandoc, job);
+
+    // v17 FIX: no `encoding` param here. This content is binary PDF data coming straight
+    // out of renderAsPdf().getContents() - it can (and for fillable forms, does) contain
+    // AcroForm dictionaries, appearance streams, and embedded font bytes above 127. Forcing
+    // file.Encoding.UTF8 reinterprets those bytes as UTF-8 text and mangles them, which
+    // silently strips/breaks the PDF's fillable form fields while the page still renders
+    // fine visually. Single-invoice mode was never affected because it streams
+    // renderer output directly and never passes it through file.create(). Leaving encoding
+    // unset lets file.create() write the bytes through untouched.
     var pdfFile = file.create({
-      name: trandoc + '.pdf',
+      name: fileName,
       fileType: file.Type.PDF,
       contents: coverfile.getContents(),
-      encoding: file.Encoding.UTF8,
-      folder: 2654 // Replace with the internal ID of the desired folder in the File Cabinet
+      folder: PDF_FOLDER_ID
     });
 
-    var fileId = pdfFile.save();
-    log.debug('PDF Saved', 'File ID: ' + fileId);
+    var fileId = null;
+    if (saveToCabinet) {
+      fileId = saveOverwritingDuplicate(pdfFile, fileName);
+      log.audit('PDF Saved', fileName + ' (File ID: ' + fileId + ')');
+    }
 
-    if (stampInvoice) {
+    if (stampInvoice && fileId) {
       try {
         // submitFields does an inline field update and skips full-record validation.
         // A full record.save() here re-runs posting period validation and throws
@@ -540,18 +686,274 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
       }
     }
 
-    return { trandoc: trandoc, file: coverfile, fileId: fileId };
+    return {
+      trandoc: trandoc,
+      fileName: fileName,
+      file: coverfile,
+      pdfFile: pdfFile,
+      fileId: fileId
+    };
+  }
+
+  // ---------------------------------------------------------------------
+  // File naming
+  // ---------------------------------------------------------------------
+
+  /**
+   * Builds "<tranid> <first word of custentity26>_<initials from custentity4>.pdf".
+   *
+   * Each boundary comes from its JOB_NAME_FIELDS entry's `separator`, so the space after the
+   * tranid and the underscore between the two job fields are set independently rather than
+   * sharing one global separator.
+   *
+   * A part that ends up blank (no job on the invoice, empty field, or a transform that finds
+   * nothing usable) is skipped AND takes its separator with it - so a missing custentity26
+   * gives "INV1042_JD.pdf", not "INV1042 _JD.pdf". Illegal file-name characters are stripped
+   * and the result is capped below NetSuite's 255-char limit.
+   */
+  function buildInvoiceFileName(trandoc, jobId) {
+    var name = sanitizeFileNamePart(trandoc);
+
+    var jobParts = getJobNameParts(jobId);
+    for (var i = 0; i < jobParts.length; i++) {
+      var spec = jobParts[i].spec;
+      var raw = jobParts[i].value;
+      var transformed = spec.transform ? spec.transform(raw) : raw;
+
+      var clean = sanitizeFileNamePart(transformed);
+      if (!clean) continue;
+
+      name = name ? name + spec.separator + clean : clean;
+    }
+
+    // Nothing usable at all (shouldn't happen - tranid is always populated) - fall
+    // back to a literal so file.create() never gets an empty name.
+    name = tidyFileName(name) || 'Invoice';
+
+    if (name.length > MAX_FILE_NAME_LENGTH) {
+      name = name.substring(0, MAX_FILE_NAME_LENGTH).replace(/[_\s\-]+$/, '');
+    }
+
+    return name + '.pdf';
   }
 
   /**
-   * Finds all open invoices for a customer, renders each one to XML using the same
-   * logic/template as single-invoice mode, wraps them all in a BFO <pdfset>, and renders
-   * that once into a single merged PDF. Every invoice that makes it into the merged PDF
-   * then has its "To Be Printed" checkbox cleared, so a repeat click of the button only
-   * picks up invoices flagged since the last run instead of reprinting everything.
+   * Returns one {spec, value} entry per JOB_NAME_FIELDS entry, in order, as display text.
+   * Cached per execution because in bulk mode several invoices commonly share a job.
    *
-   * SuiteScript has no PDF-merge API (render.mergePdfs does not exist) - <pdfset> is the
-   * supported way to combine multiple rendered documents into one file.
+   * Carrying the spec through (rather than just the value) keeps each value welded to its own
+   * separator and transform. search.lookupFields returns a plain string for free-form fields
+   * but an array of {value,text} for selects/multiselects, so a flat array of values would let
+   * a multiselect contribute several slots and desync from JOB_NAME_FIELDS - silently applying
+   * custentity4's rules to custentity26's value. Multi-values are joined into one entry instead.
+   */
+  function getJobNameParts(jobId) {
+    if (!jobId) return [];
+
+    var cacheKey = String(jobId);
+    if (_jobNamePartsCache[cacheKey]) return _jobNamePartsCache[cacheKey];
+
+    var parts = [];
+
+    try {
+      var fieldIds = [];
+      for (var f = 0; f < JOB_NAME_FIELDS.length; f++) {
+        fieldIds.push(JOB_NAME_FIELDS[f].fieldId);
+      }
+
+      var jobFields = search.lookupFields({
+        type: 'job',
+        id: jobId,
+        columns: fieldIds
+      });
+
+      for (var i = 0; i < JOB_NAME_FIELDS.length; i++) {
+        var spec = JOB_NAME_FIELDS[i];
+        var flattened = [];
+
+        addLookupText(flattened, jobFields[spec.fieldId]);
+
+        parts.push({
+          spec: spec,
+          value: flattened.join(' ')
+        });
+      }
+    } catch (e) {
+      log.error('Job name field lookup failed for job ' + jobId, e);
+    }
+
+    _jobNamePartsCache[cacheKey] = parts;
+    return parts;
+  }
+
+  // ---------------------------------------------------------------------
+  // Job field transforms
+  // ---------------------------------------------------------------------
+
+  /**
+   * First whitespace-delimited token.
+   *   "Riverbend Tower Phase 2" -> "Riverbend"
+   */
+  function firstWord(value) {
+    var text = normalizeSortText(value);   // trims; case is restored from the original below
+    if (!text) return '';
+
+    var original = String(value).replace(/^\s+|\s+$/g, '');
+    var tokens = original.split(/\s+/);
+
+    return tokens[0] || '';
+  }
+
+  /**
+   * Pulls approver initials out of an "ENV-<name>" value.
+   *
+   *   "ENV-John Doe"    -> "JD"     (multi-word name: initial of each word)
+   *   "ENV-John Q. Doe" -> "JQD"    (punctuation isn't a word)
+   *   "ENV-JD"          -> "JD"     (already initials: passed through, uppercased)
+   *   "ENV-Doe"         -> "D"      (single capitalised name: reduced to its initial)
+   *   "ENV-"            -> ""       (prefix but no name: component skipped)
+   *   "John Doe"        -> "JD"     (no ENV- prefix: whole value used, logged at debug)
+   *
+   * The no-prefix fallback is deliberate - a slightly-off initial beats dropping the
+   * component from the file name entirely, and it shows up in the log if the data is wrong.
+   */
+  function approverInitials(value) {
+    var text = String(value === null || value === undefined ? '' : value)
+      .replace(/^\s+|\s+$/g, '');
+
+    if (!text) return '';
+
+    var match = APPROVER_PREFIX_PATTERN.exec(text);
+    var remainder;
+
+    if (match) {
+      remainder = match[1];
+    } else {
+      log.debug('Approver field has no ENV- prefix', 'Using whole value: ' + text);
+      remainder = text;
+    }
+
+    // Split on anything non-alphabetic so periods, hyphens and commas in a name
+    // ("John Q. Doe", "Smith-Jones") don't produce empty tokens.
+    var words = [];
+    var rawWords = remainder.split(/[^A-Za-z]+/);
+    for (var i = 0; i < rawWords.length; i++) {
+      if (rawWords[i]) words.push(rawWords[i]);
+    }
+
+    if (!words.length) return '';
+
+    // One token: is it already initials ("JD"), or a surname to reduce ("Doe")?
+    // Length alone can't tell them apart, so lean on capitalisation - an initial-capital
+    // followed by lowercase is a name, not initials. "JD"/"jd" -> kept, "Doe" -> "D",
+    // "SMITH" -> "S" (all caps but too long to be initials).
+    if (words.length === 1) {
+      var looksLikeInitials = words[0].length <= MAX_EXISTING_INITIALS_LENGTH &&
+        !/[A-Z][a-z]/.test(words[0]);
+
+      if (looksLikeInitials) return words[0].toUpperCase();
+
+      return words[0].charAt(0).toUpperCase();
+    }
+
+    var initials = '';
+    for (var j = 0; j < words.length; j++) {
+      initials += words[j].charAt(0).toUpperCase();
+    }
+
+    return initials;
+  }
+
+  /**
+   * Final tidy-up for an assembled file name: no doubled-up underscores, and nothing left
+   * dangling at either end.
+   *
+   * Deliberately does NOT touch interior whitespace - the single space between the tranid and
+   * custentity26 is intentional. Whitespace coming from the DATA is normalised per-part by
+   * sanitizeFileNamePart() before assembly, so anything reaching here is a separator we chose.
+   */
+  function tidyFileName(name) {
+    return String(name === null || name === undefined ? '' : name)
+      .replace(/_{2,}/g, '_')
+      .replace(/^[_\s]+|[_\s]+$/g, '');
+  }
+
+  /**
+   * Normalises ONE component of a file name: strips characters NetSuite rejects (path
+   * separators, wildcards, quotes, control chars) and collapses any internal whitespace to a
+   * single underscore.
+   *
+   * Whitespace inside a part becomes an underscore rather than a space so it can't be confused
+   * with the one intentional space in the assembled name. In practice firstWord() and
+   * approverInitials() already return single tokens, so this only bites on a tranid or customer
+   * name that itself contains a space ("INV 1042" -> "INV_1042").
+   */
+  function sanitizeFileNamePart(value) {
+    if (value === null || value === undefined) return '';
+
+    return String(value)
+      .replace(/[\/\\:\*\?"<>\|\r\n\t]/g, ' ')
+      .replace(/^\s+|\s+$/g, '')
+      .replace(/\s+/g, '_');
+  }
+
+  /**
+   * Saves a file, handling the case where a file of the same name already exists in the
+   * target folder (NetSuite rejects the duplicate). Only pays for the lookup/delete when
+   * the save actually fails, so the common path costs nothing extra. The newest PDF wins
+   * - if the client would rather keep history, append a timestamp in buildInvoiceFileName()
+   * instead of deleting here.
+   */
+  function saveOverwritingDuplicate(pdfFile, fileName) {
+    try {
+      return pdfFile.save();
+    } catch (e) {
+      log.audit('Initial file save failed, checking for duplicate name', fileName + ': ' + e.message);
+
+      var existingId = findExistingFileId(fileName, PDF_FOLDER_ID);
+      if (!existingId) throw e;
+
+      file.delete({ id: existingId });
+      log.audit('Replaced existing file', fileName + ' (old File ID: ' + existingId + ')');
+      return pdfFile.save();
+    }
+  }
+
+  function findExistingFileId(fileName, folderId) {
+    var foundId = null;
+
+    try {
+      var fileSearch = search.create({
+        type: 'file',
+        filters: [
+          ['name', 'is', fileName],
+          'AND', ['folder', 'anyof', folderId]
+        ],
+        columns: ['internalid']
+      });
+
+      fileSearch.run().each(function (result) {
+        foundId = result.getValue({ name: 'internalid' });
+        return false;
+      });
+    } catch (e) {
+      log.error('Duplicate file lookup failed for ' + fileName, e);
+    }
+
+    return foundId;
+  }
+
+  // ---------------------------------------------------------------------
+  // Bulk mode
+  // ---------------------------------------------------------------------
+
+  /**
+   * Renders every invoice flagged "To Be Printed" for a customer as its OWN PDF, named per
+   * buildInvoiceFileName(), then streams all of them back as a single ZIP.
+   *
+   * Order of operations matters: the ZIP is built BEFORE any "To Be Printed" flag is cleared.
+   * If archiving throws, we bail out with every flag still set, so the user can just click the
+   * button again rather than discovering the invoices were silently de-flagged with no download.
    */
   function printAllOpenInvoicesForCustomer(context, custId) {
     var response = context.response;
@@ -559,65 +961,212 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
     var invoiceIds = getOpenInvoiceIdsForCustomer(custId);
 
     if (!invoiceIds.length) {
-      response.write('No open invoices found for this customer.');
+      response.write('No invoices for this customer are flagged "To Be Printed".');
       return;
     }
 
-    log.audit('Bulk print starting', invoiceIds.length + ' open invoices for customer ' + custId);
+    log.audit('Bulk print starting', invoiceIds.length + ' invoices flagged To Be Printed for customer ' + custId);
 
     var script = runtime.getCurrentScript();
-    var xmlParts = [];
+    var generated = [];
+    var failed = [];
     var renderedIds = [];
+    var pdfFiles = [];
+    var skipped = 0;
 
     for (var i = 0; i < invoiceIds.length; i++) {
-      // Each invoice costs roughly 60-90 governance units to render, plus another
-      // ~10 for the submitFields call that clears tobeprinted below. A Suitelet
-      // (1000 units) realistically handles about a dozen. Stop cleanly with a
-      // partial PDF rather than dying mid-run and returning nothing.
-      if (script.getRemainingUsage() < 160) {
-        log.audit('Governance limit reached', 'Rendered ' + renderedIds.length + ' of ' + invoiceIds.length + ' invoices');
+      // Per invoice this costs the render (record.load 10 + one search per billable
+      // vendor-bill/expense line) plus, if the two flags above are on, file.save (20) and
+      // up to two submitFields (20). A Suitelet has 1000 units. Stop cleanly and ZIP what
+      // we have rather than dying mid-loop and handing back nothing.
+      if (script.getRemainingUsage() < 250) {
+        skipped = invoiceIds.length - i;
+        log.audit('Governance limit reached', 'Generated ' + generated.length + ' of ' + invoiceIds.length + ' invoices; ' + skipped + ' not attempted');
         break;
       }
 
       try {
-        var result = buildInvoicePdf(invoiceIds[i], false, true);
-        xmlParts.push(stripXmlPreamble(result.xmlString));
+        var result = buildInvoicePdf(invoiceIds[i], STAMP_PDF_FIELD_IN_BULK, SAVE_INDIVIDUAL_PDFS_TO_CABINET);
+
+        // The ZIP entry name comes from the file object's `name`, which buildInvoicePdf()
+        // already set to the client's convention - so add that object, not the raw
+        // render output (whose name is auto-generated).
+        var entry = result.pdfFile;
+
+        if (ZIP_FROM_SAVED_FILES && result.fileId) {
+          entry = file.load({ id: result.fileId });
+        }
+
+        pdfFiles.push(entry);
+        generated.push({
+          invoiceId: invoiceIds[i],
+          trandoc: result.trandoc,
+          fileName: result.fileName,
+          fileId: result.fileId
+        });
         renderedIds.push(invoiceIds[i]);
       } catch (e) {
         log.error('Error rendering invoice ' + invoiceIds[i], e);
-        // Left tobeprinted untouched on failure so it's picked up again next run.
+        failed.push({ invoiceId: invoiceIds[i], message: e.message });
+        // tobeprinted left untouched on failure so it's picked up again next run.
       }
     }
 
-    if (!xmlParts.length) {
-      response.write('Could not generate any invoice PDFs.');
+    if (!pdfFiles.length) {
+      response.write('Could not generate any invoice PDFs. See the script execution log for details.');
       return;
     }
 
-    var setXml = '<?xml version="1.0"?>\n' +
-      '<!DOCTYPE pdfset PUBLIC "-//big.faceless.org//report" "report-1.1.dtd">\n' +
-      '<pdfset>' + xmlParts.join('') + '</pdfset>';
+    var zipFile;
+    try {
+      zipFile = buildInvoiceZip(custId, pdfFiles, generated, failed, skipped);
+    } catch (e) {
+      log.error('Failed to build invoice ZIP', e);
+      // Deliberately no clearToBePrinted() here - nothing was delivered, so nothing is done.
+      response.write('Generated ' + pdfFiles.length + ' PDF(s) but could not build the ZIP: ' +
+        e.message + '. No invoices were de-flagged, so you can safely retry.');
+      return;
+    }
 
-    var mergedPdf = render.xmlToPdf({ xmlString: setXml });
-
-    mergedPdf.name = 'Open_Invoices_' + custId + '.pdf';
-
-    // Clear "To Be Printed" only on invoices that actually made it into this PDF,
-    // so a re-click of the button won't pick these back up. If the merge above had
-    // thrown, we'd have exited before this point and left every flag untouched.
+    // Only now that the ZIP exists do we clear the flags.
     clearToBePrinted(renderedIds);
 
+    log.audit('Bulk print complete', generated.length + ' zipped, ' + failed.length + ' failed, ' + skipped + ' deferred');
+
     response.writeFile({
-      file: mergedPdf,
-      isInline: true
+      file: zipFile,
+      isInline: false   // false => Content-Disposition: attachment, i.e. a real download
     });
+  }
+
+  /**
+   * Wraps the generated PDFs in a single ZIP via N/compress. Entry names come from each
+   * file object's `name`, so they land in the archive under the client's naming convention.
+   *
+   * `type` is set defensively: if compress.Type isn't exposed the way this account's version
+   * expects, we omit it and let the module default (ZIP) apply rather than throwing.
+   */
+  function buildInvoiceZip(custId, pdfFiles, generated, failed, skipped) {
+    var archiver = compress.createArchiver();
+
+    for (var i = 0; i < pdfFiles.length; i++) {
+      archiver.add({ file: pdfFiles[i] });
+    }
+
+    if (INCLUDE_ZIP_MANIFEST) {
+      archiver.add({
+        file: file.create({
+          name: '_manifest.txt',
+          fileType: file.Type.PLAINTEXT,
+          contents: buildManifestText(custId, generated, failed, skipped)
+        })
+      });
+    }
+
+    var archiveOptions = { name: buildZipFileName(custId) };
+    if (compress.Type && compress.Type.ZIP) archiveOptions.type = compress.Type.ZIP;
+
+    var zipFile = archiver.archive(archiveOptions);
+
+    if (SAVE_ZIP_TO_CABINET) {
+      try {
+        zipFile.folder = PDF_FOLDER_ID;
+        log.audit('ZIP archived to file cabinet', 'File ID: ' + zipFile.save());
+      } catch (e) {
+        // A file-cabinet copy is a convenience, not the deliverable. Never let it block
+        // the download the user is waiting on.
+        log.error('Could not save ZIP copy to file cabinet', e);
+      }
+    }
+
+    return zipFile;
+  }
+
+  /**
+   * "Invoices - <Customer> - YYYY-MM-DD.zip", falling back to the internal id if the
+   * customer name can't be read. Uses lookupFields (1 unit) rather than loading the record.
+   */
+  function buildZipFileName(custId) {
+    var label = '';
+
+    try {
+      var values = search.lookupFields({
+        type: 'customer',
+        id: custId,
+        columns: ['entityid']
+      });
+      label = sanitizeFileNamePart(values.entityid);
+    } catch (e) {
+      log.debug('Customer name lookup skipped for ZIP name', e);
+    }
+
+    if (!label) label = 'Customer ' + custId;
+
+    var now = new Date();
+    var stamp = now.getFullYear() + '-' +
+      padTwo(now.getMonth() + 1) + '-' +
+      padTwo(now.getDate());
+
+    var name = tidyFileName('Invoices' + ZIP_NAME_SEPARATOR + label + ZIP_NAME_SEPARATOR + stamp);
+
+    if (name.length > MAX_FILE_NAME_LENGTH) {
+      name = name.substring(0, MAX_FILE_NAME_LENGTH).replace(/[_\-]+$/, '');
+    }
+
+    return name + '.zip';
+  }
+
+  function padTwo(n) {
+    return (n < 10 ? '0' : '') + n;
+  }
+
+  /**
+   * Plain-text run summary bundled into the ZIP. Because the response is a file download the
+   * user never sees an HTML page, so without this any partial run or per-invoice failure would
+   * only be visible in the script execution log.
+   */
+  function buildManifestText(custId, generated, failed, skipped) {
+    var lines = [];
+
+    lines.push('Invoice PDF export');
+    lines.push('Customer internal id: ' + custId);
+    lines.push('Generated: ' + new Date().toString());
+    lines.push('Script version: ' + SCRIPT_VERSION);
+    lines.push('');
+    lines.push('INCLUDED (' + generated.length + ')');
+    lines.push('----------------------------------------');
+
+    for (var i = 0; i < generated.length; i++) {
+      lines.push('  ' + generated[i].fileName +
+        '   [invoice id ' + generated[i].invoiceId +
+        (generated[i].fileId ? ', file id ' + generated[i].fileId : '') + ']');
+    }
+
+    if (failed.length) {
+      lines.push('');
+      lines.push('FAILED (' + failed.length + ') - still flagged To Be Printed, retry the button');
+      lines.push('----------------------------------------');
+      for (var j = 0; j < failed.length; j++) {
+        lines.push('  invoice id ' + failed[j].invoiceId + ': ' + failed[j].message);
+      }
+    }
+
+    if (skipped > 0) {
+      lines.push('');
+      lines.push('NOT ATTEMPTED (' + skipped + ')');
+      lines.push('----------------------------------------');
+      lines.push('  The Suitelet reached its governance limit before these were reached.');
+      lines.push('  They remain flagged To Be Printed - click the button again to continue.');
+    }
+
+    lines.push('');
+    return lines.join('\n');
   }
 
   /**
    * Clears the native "To Be Printed" checkbox on each given invoice via submitFields
    * (inline field update, no full-record validation/posting-period checks). Failures
-   * are logged per-invoice rather than thrown, so one bad record doesn't block the
-   * others or the PDF the user is about to receive.
+   * are logged per-invoice rather than thrown, so one bad record doesn't block the others.
    */
   function clearToBePrinted(invoiceIds) {
     for (var i = 0; i < invoiceIds.length; i++) {
@@ -640,28 +1189,10 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
   }
 
   /**
-   * Each rendered invoice comes back as a full standalone document. For <pdfset> the
-   * inner entries must be bare <pdf>...</pdf> elements, so drop the XML declaration
-   * and DOCTYPE from each one.
-   */
-  function stripXmlPreamble(xmlString) {
-    return String(xmlString)
-      .replace(/<\?xml[^>]*\?>/gi, '')
-      .replace(/<!DOCTYPE[^>]*>/gi, '')
-      .replace(/^\s+|\s+$/g, '');
-  }
-
-  /**
    * Returns internal ids of the customer's invoices flagged "To Be Printed" - the same
    * single criterion native bulk print uses. Status is deliberately not filtered, so a
    * paid or closed invoice still prints if someone left the flag checked, exactly as
    * native behaves.
-   *
-   * Invoices in subsidiary 4 (Construction Earthwork) are excluded from this bulk pull.
-   * This filter lives only here - it does not touch buildInvoicePdf() or the recId/
-   * single-invoice path, so the existing "Print BC PDF" button/UE that calls this
-   * Suitelet with ?recId= is unaffected and can still print a Construction Earthwork
-   * invoice directly when someone opens it.
    */
   function getOpenInvoiceIdsForCustomer(custId) {
     var ids = [];
@@ -671,8 +1202,7 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
       filters: [
         ['entity', 'anyof', custId],
         'AND', ['mainline', 'is', 'T'],
-        'AND', ['tobeprinted', 'is', 'T'],
-        'AND', ['subsidiary', 'noneof', '4']
+        'AND', ['tobeprinted', 'is', 'T']
       ],
       columns: [
         search.createColumn({ name: 'internalid' }),
@@ -687,7 +1217,6 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
 
     return ids;
   }
-
 
   // ---------------------------------------------------------------------
   // Unchanged helper functions from the original script
@@ -729,8 +1258,17 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
     }, {});
   }
 
+  /**
+   * Unchanged logic, now memoised per execution. This runs one transaction search per
+   * applied billable line; without the cache a bulk run re-searched the same vendor bill
+   * every time it appeared, which dominated governance usage.
+   */
   function determineBillGrouping(transactionID, recordType) {
     recordType = recordType || 'vendorbill';
+
+    var cacheKey = recordType + ':' + String(transactionID);
+    if (_billGroupingCache[cacheKey]) return _billGroupingCache[cacheKey];
+
     var grouping = '';
     var isSubcontractor = '';
     var isRentedEquipment = '';
@@ -771,7 +1309,8 @@ define(['N/render', 'N/record', 'N/xml', 'N/file', 'N/task', 'N/search', 'N/runt
       grouping = 'Other';
     }
 
-    return {type: grouping, tranid: tranid, entity: entity};
+    _billGroupingCache[cacheKey] = {type: grouping, tranid: tranid, entity: entity};
+    return _billGroupingCache[cacheKey];
   }
 
   function determineTimeGrouping(timeID) {
