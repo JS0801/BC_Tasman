@@ -19,8 +19,8 @@ define(['N/search', 'N/url', 'N/file', 'N/task'], function (search, url, file, t
   var PDF_SUITELET_SCRIPT_ID = 'customscript_bc_sl_inv_pdf_printv2';
   var PDF_SUITELET_DEPLOYMENT_ID = 'customdeploy1';
 
-  var DEFAULT_CONCURRENCY = 2;
-  var MAX_INVOICES_PER_RUN = 200;
+  var DEFAULT_CONCURRENCY = 3;
+  var MAX_INVOICES_PER_RUN = 300;
   var CSV_IMPORT_FOLDER_ID = 2654;
   var CSV_IMPORT_SCHEDULED_SCRIPT_ID = 'customscript_bc_sch_submit_csv_import';
   var CSV_IMPORT_SCHEDULED_DEPLOYMENT_ID = 'customdeploy_bc_sch_submit_csv_import';
