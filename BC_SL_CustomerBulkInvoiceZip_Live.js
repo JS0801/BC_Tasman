@@ -27,7 +27,7 @@ define(['N/search', 'N/url', 'N/file', 'N/task'], function (search, url, file, t
 
   // Set this to the saved CSV import map id that updates Invoice records by Internal ID
   // and maps "To Be Printed" to the native To Be Printed checkbox.
-  var CSV_IMPORT_MAPPING_ID = '189';
+  var CSV_IMPORT_MAPPING_ID = '190';
   var PARAM_CSV_FILE_ID = 'custscript_bc_inv_csv_file_id';
   var PARAM_CSV_IMPORT_MAPPING_ID = 'custscript_bc_inv_csv_mapping_id';
   var PARAM_CSV_IMPORT_TASK_NAME = 'custscript_bc_inv_csv_task_name';
